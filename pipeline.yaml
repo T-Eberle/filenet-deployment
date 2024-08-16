@@ -1,0 +1,595 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: filenet-install
+  namespace: default
+  labels:
+    app: filenet
+spec:
+  params:
+    - name: git-url
+      type: string
+    - name: namespace
+      type: string
+      default: "fncm"
+    - name: operator-channel
+      type: string
+      default: "v24.0"
+    - name: enable-css
+      type: string
+      default: "true"
+    - name: enable-ts
+      type: string
+      default: "false"
+    - name: fast-storage-classname
+      type: string
+      default: ocs-storagecluster-cephfs
+    - name: medium-storage-classname
+      type: string
+      default: ocs-storagecluster-cephfs 
+    - name: slow-storage-classname
+      type: string
+      default: ocs-storagecluster-cephfs
+    - name: openldap-namespace
+      type: string
+      default: "fncm-openldap"
+    - name: postgresql-namespace
+      type: string
+      default: "fncm-postgresql"
+    - name: cpadmin-password
+      type: string
+      default: Password
+  workspaces:
+    - name: git-repository
+      optional: false
+  tasks:
+  # TODO add Task to check, if secret "ibm-entitlement-key" is available. If not, create it.
+  - name: git-clone
+    taskRef:
+      name: git-clone
+      kind: ClusterTask
+    params:
+      - name: url
+        value: $(params.git-url)
+    workspaces:
+    - name: output
+      workspace: git-repository
+
+  - name: fncm-operator-install
+    taskRef:
+      name: openshift-client
+    params:
+      - name: SCRIPT
+        value: |
+          oc new-project $(params.namespace) || oc project $(params.namespace)
+
+          cat <<EOF | oc apply -f -
+            apiVersion: operators.coreos.com/v1alpha1
+            kind: CatalogSource
+            metadata:
+              name: ibm-fncm-operator-catalog
+              namespace: openshift-marketplace
+            spec:
+              displayName: ibm-fncm-operator
+              publisher: IBM
+              sourceType: grpc
+              image: icr.io/cpopen/ibm-fncm-catalog@sha256:9dd34128b6b0d961b01d89260b276830452f0d1c8180855e8f9d42cca9bd5cf8
+              updateStrategy:
+                registryPoll:
+                  interval: 45m
+          EOF
+
+          cat <<EOF | oc apply -f -
+            apiVersion: operators.coreos.com/v1alpha2
+            kind: OperatorGroup
+            metadata:
+              name: ibm-fncm-operator-catalog-group
+              namespace: $(params.namespace)
+            spec:
+              targetNamespaces:
+              - $(params.namespace)
+          EOF
+
+          cat <<EOF | oc apply -f -
+            apiVersion: operators.coreos.com/v1alpha1
+            kind: Subscription
+            metadata:
+              name: ibm-fncm-operator-catalog-subscription
+              namespace: $(params.namespace)
+            spec:
+              channel: $(params.operator-channel)
+              name: ibm-fncm-operator
+              installPlanApproval: Automatic
+              source: ibm-fncm-operator-catalog
+              sourceNamespace: openshift-marketplace
+          EOF
+  - name: prepare-installation
+    runAfter:
+    - git-clone
+    taskSpec:
+        steps:
+        - computeResources: {}
+          env:
+          - name: HOME
+            value: /tekton/home
+          image: registry.access.redhat.com/ubi9/python-312:latest
+          name: script
+          script: |
+            #!/usr/bin/env bash
+
+            cd $(workspaces.manifest-dir.path)
+
+            $(params.SCRIPT)
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+        params:
+          - name: SCRIPT
+            type: string
+        workspaces:
+        - description: The workspace which contains kubernetes manifests which we want to
+            apply on the cluster.
+          name: manifest-dir
+    params:
+    - name: SCRIPT
+      value: |
+        cd scripts
+        echo "Installing stuff..."
+
+        sed -i \
+          -e 's/CSS = false/CSS = $(params.enable-css)/g' \
+          -e 's/TM = false/TM = $(params.enable-ts)/g' \
+          -e 's/DATABASE_TYPE = 5/DATABASE_TYPE = 4/g' \
+          -e 's/DATABASE_SSL_ENABLE = true/DATABASE_SSL_ENABLE = false/g' \
+          -e 's/LDAP_SSL_ENABLE = true/LDAP_SSL_ENABLE = false/g' \
+          silent_config/silent_install_prerequisites.toml
+
+        cat silent_config/silent_install_prerequisites.toml
+
+
+        pip install -r requirements.txt
+        echo "Gathering stuff..."
+        python prerequisites.py --silent gather
+
+        sed -i \
+        -e 's/SLOW_FILE_STORAGE_CLASSNAME = "<Required>"/'\
+        'SLOW_FILE_STORAGE_CLASSNAME = "$(params.slow-storage-classname)"/g' \
+        -e 's/MEDIUM_FILE_STORAGE_CLASSNAME = "<Required>"/'\
+        'MEDIUM_FILE_STORAGE_CLASSNAME = "$(params.medium-storage-classname)"/g' \
+        -e 's/FAST_FILE_STORAGE_CLASSNAME = "<Required>"/'\
+        'FAST_FILE_STORAGE_CLASSNAME = "$(params.fast-storage-classname)"/g' \
+        propertyFile/fncm_deployment.toml
+
+
+        sed -i \
+        -e 's/LDAP_SERVER = "<Required>"/LDAP_SERVER = "openldap.$(params.openldap-namespace).svc.cluster.local"/g' \
+        -e 's/LDAP_BASE_DN = "<Required>"/LDAP_BASE_DN = "dc=cp,dc=internal"/g' \
+        -e 's/LDAP_GROUP_BASE_DN = "<Required>"/LDAP_GROUP_BASE_DN = "ou=Groups,dc=cp,dc=internal"/g' \
+        -e 's/LDAP_BIND_DN = """<Required>"""/LDAP_BIND_DN = """cn=admin,dc=cp,dc=internal"""/g' \
+        -e 's/LDAP_BIND_DN_PASSWORD = """<Required>"""/LDAP_BIND_DN_PASSWORD = """Password"""/g' \
+        -e 's/LDAP_USER_NAME_ATTRIBUTE = "\*:uid"/LDAP_USER_NAME_ATTRIBUTE = "*:cn"/g' \
+        -e 's/LC_USER_FILTER = "(\&(uid=%v)(objectclass=person))"/LC_USER_FILTER = "(\&(uid=%v)(objectclass=inetOrgPerson))"/g' \
+        -e 's/LC_GROUP_FILTER = "(\&(cn=%v)(|(objectclass=groupofnames)(objectclass=groupofuniquenames)(objectclass=groupofurls)))"/LC_GROUP_FILTER = "(\&(cn=%v)(|(objectclass=groupofnames)(objectclass=groupofuniquenames)))"/g' \
+        propertyFile/fncm_ldap_server.toml
+
+
+        sed -i \
+        -e 's/KEYSTORE_PASSWORD = """<Required>"""/KEYSTORE_PASSWORD = """$(params.cpadmin-password)"""/g' \
+        -e 's/LTPA_PASSWORD = """<Required>"""/LTPA_PASSWORD = """$(params.cpadmin-password)"""/g' \
+        -e 's/FNCM_LOGIN_USER = """<Required>"""/FNCM_LOGIN_USER = """cpadmin"""/g' \
+        -e 's/FNCM_LOGIN_PASSWORD = """<Required>"""/FNCM_LOGIN_PASSWORD = """$(params.cpadmin-password)"""/g' \
+        -e 's/ICN_LOGIN_USER = """<Required>"""/ICN_LOGIN_USER = """cpadmin"""/g' \
+        -e 's/ICN_LOGIN_PASSWORD = """<Required>"""/ICN_LOGIN_PASSWORD = """$(params.cpadmin-password)"""/g' \
+        -e 's/GCD_ADMIN_USER_NAME = \["""<Required>"""\]/GCD_ADMIN_USER_NAME = \["""cpadmin"""\]/g' \
+        -e 's/GCD_ADMIN_GROUPS_NAME = \["""<Required>"""\]/GCD_ADMIN_GROUPS_NAME = \["""cpadmins"""\]/g' \
+        -e 's/CPE_OBJ_STORE_OS_ADMIN_USER_GROUPS = \["""<Required>"""\]/CPE_OBJ_STORE_OS_ADMIN_USER_GROUPS = \["""cpadmin""","""cpadmins"""\]/g' \
+        propertyFile/fncm_user_group.toml
+
+        # TODO parameterise passwords!
+        sed -i \
+        -e 's/DATABASE_SERVERNAME = "<Required>"/DATABASE_SERVERNAME = "postgresql.$(params.postgresql-namespace).svc.cluster.local"/g' \
+        -e '0,/DATABASE_NAME = "<Required>"/s//DATABASE_NAME = "devgcd"/' \
+        -e '0,/DATABASE_USERNAME = """<Required>"""/s//DATABASE_USERNAME = """devgcd"""/' \
+        -e '0,/DATABASE_PASSWORD = """<Required>"""/s//DATABASE_PASSWORD = """Password"""/' \
+        -e '0,/DATABASE_NAME = "<Required>"/s//DATABASE_NAME = "devos1"/' \
+        -e '0,/DATABASE_USERNAME = """<Required>"""/s//DATABASE_USERNAME = """devos1"""/' \
+        -e '0,/DATABASE_PASSWORD = """<Required>"""/s//DATABASE_PASSWORD = """Password"""/' \
+        -e '0,/DATABASE_NAME = "<Required>"/s//DATABASE_NAME = "devicn"/' \
+        -e '0,/DATABASE_USERNAME = """<Required>"""/s//DATABASE_USERNAME = """devicn"""/' \
+        -e '0,/DATABASE_PASSWORD = """<Required>"""/s//DATABASE_PASSWORD = """Password"""/' \
+        -e '0,/TABLESPACE_NAME = "ICNDB"/s//TABLESPACE_NAME = "devicn_tbs"/' \
+        -e '0,/SCHEMA_NAME = "ICNDB"/s//SCHEMA_NAME = "devicn"/' \
+        propertyFile/fncm_db_server.toml
+
+
+        echo "Generate Openshift resources..."
+        python prerequisites.py --silent generate
+
+        sed -i \
+        -e 's/lc_selected_ldap_type: IBM Security Directory Server/lc_selected_ldap_type: Custom/g' \
+        -e 's/tds:/custom:/g' \
+        generatedFiles/ibm_fncm_cr_production.yaml
+
+        cat generatedFiles/ibm_fncm_cr_production.yaml
+    workspaces:
+    - name: manifest-dir
+      workspace: git-repository
+  - name: install-postgresql
+    runAfter:
+    - prepare-installation
+    taskRef:
+      name: openshift-client
+    params:
+    - name: SCRIPT
+      value: |
+        oc new-project $(params.postgresql-namespace) || oc project $(params.postgresql-namespace)
+        oc create configmap postgresql-scripts --from-file=scripts/generatedFiles/database/
+
+        oc create secret generic postgresql-config --from-literal=POSTGRES_DB=postgresdb --from-literal=POSTGRES_PASSWORD=Password --from-literal=POSTGRES_USER=cpadmin
+        oc label secret postgresql-config app=postgresql-config
+
+        oc create serviceaccount postgresql
+        oc policy add-role-to-user system:openshift:scc:privileged system:serviceaccount:$(params.postgresql-namespace):postgresql
+
+        cat <<EOF | oc apply -f -
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: postgresql
+
+          spec:
+            serviceName: postgresql
+            replicas: 1
+            selector:
+              matchLabels:
+                app: fncm-postgresql
+            template:
+              metadata:
+                labels:
+                  app: fncm-postgresql
+              spec:
+                serviceAccountName: "postgresql"
+                initContainers:
+                  - name: prepare-directories
+                    image: registry.access.redhat.com/ubi9/ubi-minimal:9.4-1194
+                    command: ['/bin/sh']
+                    args:
+                    - '-c'
+                    - >-
+                        set -x &&
+                        mkdir -p /pgsqldata/devicn &&
+                        chown 70:70 /pgsqldata/devicn &&
+                        mkdir -p /pgsqldata/devos1 &&
+                        chown 70:70 /pgsqldata/devos1 &&
+                        mkdir -p /pgsqldata/devgcd &&
+                        chown 70:70 /pgsqldata/devgcd &&
+                        ls -l /pgsqldata
+                    volumeMounts:
+                    - mountPath: /pgsqldata
+                      name: postgresql-data
+                      subPath: tablespaces
+                containers:
+                  - name: postgresql
+                    args:
+                      - '-c'
+                      - max_prepared_transactions=500
+                      - '-c'
+                      - max_connections=500
+                    resources:
+                      limits:
+                        memory: 4Gi
+                      requests:
+                        memory: 4Gi
+                    livenessProbe:
+                      exec:
+                        command:
+                          - /bin/sh
+                          - -c
+                          - exec pg_isready -U \$POSTGRES_USER -d \$POSTGRES_DB
+                      failureThreshold: 6
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                      successThreshold: 1
+                      timeoutSeconds: 5
+                    readinessProbe:
+                      exec:
+                        command:
+                          - /bin/sh
+                          - -c
+                          - exec pg_isready -U \$POSTGRES_USER -d \$POSTGRES_DB
+                      failureThreshold: 6
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
+                      successThreshold: 1
+                      timeoutSeconds: 5
+                    startupProbe:
+                      exec:
+                        command:
+                          - /bin/sh
+                          - -c
+                          - exec pg_isready -U \$POSTGRES_USER -d \$POSTGRES_DB
+                      failureThreshold: 18
+                      periodSeconds: 10
+                    # TODO Check if really required
+                    securityContext:
+                      privileged: true
+                    image: postgres:14.7-alpine3.17
+                    imagePullPolicy: IfNotPresent
+                    ports:
+                      - containerPort: 5432
+                    envFrom:
+                      - secretRef:
+                          name: postgresql-config
+                    volumeMounts:
+                      - mountPath: /var/lib/postgresql/data
+                        name: postgresql-data
+                        subPath: data
+                      - mountPath: /docker-entrypoint-initdb.d
+                        name: database-scripts
+                      - mountPath: /pgsqldata
+                        name: postgresql-data
+                        subPath: tablespaces
+                volumes:
+                - name: database-scripts
+                  configMap:
+                    name: postgresql-scripts
+            volumeClaimTemplates:
+            - metadata:
+                name: postgresql-data
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                storageClassName: ocs-storagecluster-ceph-rbd
+                resources:
+                  requests:
+                    storage: 5Gi
+        EOF
+        cat <<EOF | oc apply -f -
+          kind: Service
+          apiVersion: v1
+          metadata:
+            name: postgresql
+            labels:
+              app: fncm-postgresql
+          spec:
+            type: NodePort
+            ports:
+              - port: 5432
+            selector:
+              app: fncm-postgresql
+        EOF
+    workspaces:
+    - name: manifest-dir
+      workspace: git-repository
+  - name: install-openldap
+    runAfter:
+    - install-postgresql
+    taskRef:
+      name: openshift-client
+    workspaces:
+    - name: manifest-dir
+      workspace: git-repository
+    params:
+    - name: SCRIPT
+      value: |
+        oc new-project $(params.openldap-namespace) || oc project $(params.openldap-namespace)
+
+        oc create serviceaccount openldap
+        oc policy add-role-to-user system:openshift:scc:privileged system:serviceaccount:$(params.openldap-namespace):openldap
+
+        oc create configmap openldap-env \
+          --from-literal=BITNAMI_DEBUG="true"
+          --from-literal=LDAP_ORGANISATION="cp.interal" \
+          --from-literal=LDAP_ROOT="dc=cp,dc=internal" \
+          --from-literal=LDAP_DOMAIN="cp.internal"
+      
+        oc label configmap openldap-env app=fncm-openldap
+
+        cat <<EOF >> 01-sds-schema.ldif
+          dn: cn=sds,cn=schema,cn=config
+          objectClass: olcSchemaConfig
+          cn: sds
+          olcAttributeTypes: {0}( 1.3.6.1.4.1.42.2.27.4.1.6 NAME 'ibm-entryUuid' DESC 
+            'Uniquely identifies a directory entry throughout its life.' EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+          olcObjectClasses: {0}( 1.3.6.1.4.1.42.2.27.4.2.1 NAME 'sds' DESC 'sds' SUP top AUXILIARY MUST ( cn $ ibm-entryuuid ) )
+        EOF
+
+        cat <<EOF >> 02-default-users.ldif
+          # cp.internal
+          dn: dc=cp,dc=internal
+          objectClass: top
+          objectClass: dcObject
+          objectClass: organization
+          o: cp.internal
+          dc: cp
+
+          # Units
+          dn: ou=Users,dc=cp,dc=internal
+          objectClass: organizationalUnit
+          ou: Users
+
+          dn: ou=Groups,dc=cp,dc=internal
+          objectClass: organizationalUnit
+          ou: Groups
+
+          # Users
+          dn: uid=cpadmin,ou=Users,dc=cp,dc=internal
+          objectClass: inetOrgPerson
+          objectClass: sds
+          objectClass: top
+          cn: cpadmin
+          sn: cpadmin
+          uid: cpadmin
+          mail: cpadmin@cp.internal
+          userpassword: Password
+          employeeType: admin
+          ibm-entryuuid: e6c41859-ced3-4772-bfa3-6ebbc58ec78a
+
+          dn: uid=cpuser,ou=Users,dc=cp,dc=internal
+          objectClass: inetOrgPerson
+          objectClass: sds
+          objectClass: top
+          cn: cpuser
+          sn: cpuser
+          uid: cpuser
+          mail: cpuser@cp.internal
+          userpassword: Password
+          ibm-entryuuid: 40324128-84c8-48c3-803d-4bef500f84f1
+
+          # Groups
+          dn: cn=cpadmins,ou=Groups,dc=cp,dc=internal
+          objectClass: groupOfNames
+          objectClass: sds
+          objectClass: top
+          cn: cpadmins
+          ibm-entryuuid: 53f96449-2b7e-4402-a58a-9790c5089dd0
+          member: uid=cpadmin,ou=Users,dc=cp,dc=internal
+
+          dn: cn=cpusers,ou=Groups,dc=cp,dc=internal
+          objectClass: groupOfNames
+          objectClass: sds
+          objectClass: top
+          cn: cpusers
+          ibm-entryuuid: 30183bb0-1012-4d23-8ae2-f94816b91a75
+          member: uid=cpadmin,ou=Users,dc=cp,dc=internal
+          member: uid=cpuser,ou=Users,dc=cp,dc=internal
+        EOF
+
+        oc create configmap openldap-customldif --from-file=01-sds-schema.ldif --from-file=02-default-users.ldif
+        oc label configmap openldap-customldif app=fncm-openldap
+
+        oc create secret generic openldap --from-literal=LDAP_ADMIN_PASSWORD=$(params.cpadmin-password)
+        oc label secret  openldap app=fncm-openldap
+
+
+        cat <<EOF | oc apply -f -
+          kind: PersistentVolumeClaim
+          apiVersion: v1
+          metadata:
+            name: openldap-data
+            namespace: $(params.openldap-namespace)
+            labels:
+              app: fncm-openldap
+          spec:
+            accessModes:
+              - ReadWriteMany
+            resources:
+              requests:
+                storage: 1Gi
+            storageClassName: ocs-storagecluster-cephfs
+            volumeMode: Filesystem
+        EOF
+
+        cat <<EOF | oc apply -f -
+          kind: Deployment
+          apiVersion: apps/v1
+          metadata:
+            name: openldap
+            namespace: $(params.openldap-namespace)
+            labels:
+              app: fncm-openldap
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: fncm-openldap
+            template:
+              metadata:
+                labels:
+                  app: fncm-openldap
+              spec:
+                serviceAccountName: openldap
+                containers:
+                  - name: openldap
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 256Mi
+                      limits:
+                        cpu: 500m
+                        memory: 512Mi
+                    startupProbe:
+                      tcpSocket:
+                        port: ldap-port
+                      timeoutSeconds: 1
+                      periodSeconds: 10
+                      successThreshold: 1
+                      failureThreshold: 30
+                    readinessProbe:
+                      tcpSocket:
+                        port: ldap-port
+                      initialDelaySeconds: 60
+                      timeoutSeconds: 1
+                      periodSeconds: 10
+                      successThreshold: 1
+                      failureThreshold: 10
+                    livenessProbe:
+                      tcpSocket:
+                        port: ldap-port
+                      initialDelaySeconds: 60
+                      timeoutSeconds: 1
+                      periodSeconds: 10
+                      successThreshold: 1
+                      failureThreshold: 10
+                    terminationMessagePath: /dev/termination-log
+                    ports:
+                      - name: ldap-port
+                        containerPort: 1389
+                        protocol: TCP
+                    image: 'bitnami/openldap:2.6.5'
+                    imagePullPolicy: IfNotPresent
+                    volumeMounts:
+                      - name: openldap-data
+                        mountPath: /bitnami/openldap/
+                      - name: custom-ldif-files
+                        mountPath: /ldifs/02-default-users.ldif
+                        subPath: 02-default-users.ldif
+                      - name: custom-ldif-files
+                        mountPath: /schemas/01-sds-schema.ldif
+                        subPath: 01-sds-schema.ldif
+                    terminationMessagePolicy: File
+                    envFrom:
+                      - configMapRef:
+                          name: openldap-env
+                      - secretRef:
+                          name: openldap
+                    securityContext:
+                      privileged: true
+                volumes:
+                  - name: custom-ldif-files
+                    configMap:
+                      name: openldap-customldif
+                      defaultMode: 420
+                  - name: openldap-data
+                    persistentVolumeClaim:
+                      claimName: openldap-data
+        EOF
+
+        cat <<EOF | oc apply -f -
+          kind: Service
+          apiVersion: v1
+          metadata:
+            name: openldap
+            namespace: $(params.openldap-namespace)
+            labels:
+              app: fncm-openldap
+          spec:
+            ports:
+              - name: ldap-port
+                protocol: TCP
+                port: 389
+                targetPort: ldap-port
+            type: NodePort
+            selector:
+              app: fncm-openldap            
+        EOF
+
+    
+  
+    
+  # TODO Step 2: OpenLDAP installieren
+ # - name: install-openldap
+  # TODO Step 3: Postgres installieren
+ # - name: install-postgresql
+
+  

@@ -1,0 +1,32 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: filenet-install
+  namespace: default
+  labels:
+    app: filenet
+spec:
+  pipelineRef:
+    name: filenet-install
+  taskRunTemplate:
+    serviceAccountName: pipeline
+    podTemplate:
+      securityContext:
+        fsGroup: 65532
+  workspaces:
+    - name: git-repository
+      volumeClaimTemplate:
+        metadata:
+          creationTimestamp: null
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 500Mi
+          storageClassName: ocs-storagecluster-cephfs
+          volumeMode: Filesystem
+        status: {}
+  params:
+  - name: git-url
+    value: https://github.com/ibm-ecm/container-samples.git
