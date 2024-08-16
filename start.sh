@@ -2,7 +2,7 @@
 
 echo "Deleting pipelines and pipeline runs referring to filenet..."
 
-oc delete pipeline,pipelinerun -l "app=filenet"
+oc delete pipeline,pipelinerun -l "app=filenet" -n default
 
 echo "Applying pipeline..."
 
